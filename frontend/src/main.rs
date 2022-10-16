@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use backend::shirt_state::{Name, ShirtSize, UserId, Votes};
 use futures::stream::SplitStream;
 use futures::{SinkExt, StreamExt};
 use gloo_net::websocket::futures::WebSocket;
 use gloo_net::websocket::Message;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use shirt_size_server::shirt_state::{Name, ShirtSize, UserId, Votes};
 use sycamore::futures::{spawn_local, spawn_local_scoped};
 use sycamore::prelude::*;
 use sycamore::suspense::Suspense;

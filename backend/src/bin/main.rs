@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 
 use axum::routing::get_service;
 use axum_sessions::{async_session::MemoryStore, SessionLayer};
-use backend::{backend_config, Error, Result};
+use shirt_size_server::{backend_config, Error, Result};
 use std::env;
 use tower_http::{
     services::{ServeDir, ServeFile},
@@ -36,7 +36,8 @@ async fn main() -> Result<()> {
     let secret = api_key.as_bytes();
     let session_layer = SessionLayer::new(store, secret);
     let host_port = http_config.http_port;
-    let shirt_size_service = backend::shirt_state::shirt_service::ShirtSizeService::new(&api_key);
+    let shirt_size_service =
+        shirt_size_server::shirt_state::shirt_service::ShirtSizeService::new(&api_key);
 
     let sock_addr = SocketAddr::new(http_config.host.parse()?, http_config.http_port);
     let app = Router::new()

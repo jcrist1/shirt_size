@@ -19,7 +19,7 @@ web-sys = {version = "0.3.55", features = [
         "HtmlSelectElement",
         "HtmlTextAreaElement"]}
 tracing-wasm = "0.2.1"
-backend = {path = "../backend"}
+shirt-size-server = {path = "../backend"}
 console_error_panic_hook = "0.1.7"
 anyhow = "1.0.65"
 futures = "0.3.24"
