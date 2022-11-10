@@ -17,7 +17,9 @@ web-sys = {version = "0.3.55", features = [
         "Location",
         "Storage",
         "HtmlSelectElement",
-        "HtmlTextAreaElement"]}
+        "HtmlTextAreaElement",
+        "EventSource",
+        ]}
 tracing-wasm = "0.2.1"
 shirt-size-server = {path = "../backend"}
 console_error_panic_hook = "0.1.7"

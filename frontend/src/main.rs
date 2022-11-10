@@ -12,8 +12,9 @@ use sycamore::futures::{spawn_local, spawn_local_scoped};
 use sycamore::prelude::*;
 use sycamore::suspense::Suspense;
 use tracing::{info, warn};
+use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::{JsCast, JsValue};
-use web_sys::{Event, HtmlInputElement};
+use web_sys::{Event, EventSource, HtmlInputElement, MessageEvent};
 
 fn set_key_signal(event: Event, key_signal: &Signal<String>) -> anyhow::Result<()> {
     let value = event
@@ -185,7 +186,7 @@ fn set_local<T: Serialize>(key: &str, t: &T) -> anyhow::Result<()> {
 
 #[allow(non_snake_case)]
 #[component]
-async fn PageComponent<'a, G: Html>(cx: Scope<'a>) -> View<G> {
+async fn PageComponent<G: Html>(cx: Scope<'_>) -> View<G> {
     let (name, initial_state) = match get_local("name") {
         Err(err) => {
             warn!("Now something is badly wrong. Try clearing local cookies/local storage");
@@ -195,17 +196,19 @@ async fn PageComponent<'a, G: Html>(cx: Scope<'a>) -> View<G> {
         Ok(Some(name)) => (name, PageState::NotLoggedIn),
     };
     let name = create_signal(cx, name);
-    let page_state = create_signal(cx, initial_state);
-    view! {cx, ({
+    let page_state: RcSignal<PageState> = create_rc_signal(initial_state);
+    view! {cx,  ({
+        let page_state_clone = page_state.clone();
+        let page_state_clone_2 = page_state.clone();
         match page_state.get().as_ref() {
             PageState::NotLoggedIn => view! { cx,
-                LoginComponent((name, page_state))
+                LoginComponent((name, page_state_clone))
             },
             PageState::Error => view! { cx,
                 div {"Error"}
             },
             PageState::VotePage { user, shirt_sizes, admin } => view! {cx,
-                VoteComponent((user.clone(), *admin, shirt_sizes.clone(), page_state ))
+                VoteComponent((user.clone(), *admin, shirt_sizes.clone(), page_state_clone_2))
             },
         }
     })}
@@ -215,7 +218,7 @@ async fn PageComponent<'a, G: Html>(cx: Scope<'a>) -> View<G> {
 #[component]
 async fn LoginComponent<'a, G: Html>(
     cx: Scope<'a>,
-    input: (&'a Signal<Name>, &'a Signal<PageState>),
+    input: (&'a Signal<Name>, RcSignal<PageState>),
 ) -> View<G> {
     let (name, page_state) = input;
     let change_name = move |event: Event| -> anyhow::Result<()> {
@@ -243,6 +246,7 @@ async fn LoginComponent<'a, G: Html>(
 
         }
         div(on:click = move |_| {
+            let page_state_clone = page_state.clone();
             spawn_local_scoped(cx, async move {
                 let name = name.get();
                 let new_state = match log_in(name.as_ref()).await {
@@ -252,7 +256,7 @@ async fn LoginComponent<'a, G: Html>(
                         PageState::Error
                     }
                 };
-                page_state.set(new_state);
+                page_state_clone.set(new_state);
             });
         }) {"login"}
     }
@@ -317,7 +321,11 @@ async fn reveal() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn get_websocket() -> anyhow::Result<WebSocket> {
+fn get_sse() -> anyhow::Result<()> {
+    Ok(())
+}
+
+fn get_event_source() -> anyhow::Result<EventSource> {
     let window = web_sys::window().ok_or_else(|| {
         Error::Message("Should be in a web_sys environment to open this web socket".into())
     })?;
@@ -336,59 +344,66 @@ fn get_websocket() -> anyhow::Result<WebSocket> {
     let host = location
         .host()
         .map_err(|err| Error::Message(format!("Failed to get location for window: {err:?}")))?;
-    let url = format!("{protocol}://{host}/api/v1/shirt-size/votes-ws");
-    Ok(
-        gloo_net::websocket::futures::WebSocket::open(&url).map_err(|err| {
-            Error::Message(format!(
-                "Failed to open Websocket at url: {url}, error: {err:?}"
-            ))
-        })?,
-    )
+    let url = format!("/api/v1/shirt-size/votes-ws");
+    Ok(EventSource::new(&url)
+        .map_err(|err| Error::Message(format!("Error openning event source: {err:?}")))?)
 }
 
 #[allow(non_snake_case)]
 #[component]
 async fn VoteComponent<'a, G: Html>(
     cx: Scope<'a>,
-    page_state: (Name, bool, Vec<ShirtSize>, &'a Signal<PageState>),
+    page_state: (Name, bool, Vec<ShirtSize>, RcSignal<PageState>),
 ) -> View<G> {
     let (name, is_admin, shirt_sizes, page_state) = page_state;
-    let vote_state = create_signal(
-        cx,
-        VotePageState::Voting {
-            own_vote: None,
-            users: vec![],
-        },
-    );
+    let vote_state = create_rc_signal(VotePageState::Voting {
+        own_vote: None,
+        users: vec![],
+    });
     let current_vote = create_signal(cx, None);
     let revealed = create_signal(cx, false);
 
+    let page_state_for_handler = page_state.clone();
+    let vote_state_for_handler = vote_state.clone();
+    let page_state_for_task = page_state.clone();
     spawn_local_scoped(cx, async move {
-        match get_websocket() {
+        match get_event_source() {
             Err(err) => {
                 warn!("Encountered error openning web socket for votes: {err}");
-                page_state.set(PageState::Error)
+                page_state_for_task.set(PageState::Error)
             }
-            Ok(ws) => {
-                let (mut write, mut read) = ws.split();
-                loop {
-                    match get_next_state(&mut read).await {
-                        Ok(votes) => {
-                            if votes.find_name(&name) {
-                                vote_state.set(vote_page_from_votes(votes));
-                            } else {
-                                page_state.set(PageState::NotLoggedIn)
-                            }
+            Ok(event_source) => {
+                event_source.set_onmessage(Some(
+                    Closure::new(Box::new(move |event: MessageEvent| {
+                        let votes = serde_json::from_str::<Votes>(
+                            &event.data().as_string().expect("FOO EVENT SOURCE SUCKS"),
+                        )
+                        .expect("Not votes in this sucky ass event source json?!?!?");
+                        if votes.find_name(&name) {
+                            vote_state_for_handler.set(vote_page_from_votes(votes));
+                        } else {
+                            page_state_for_handler.set(PageState::NotLoggedIn)
                         }
-                        Err(err) => {
-                            warn!(
-                                "Encountered error getting data from web socket for votes: {err:?}"
-                            );
-                            page_state.set(PageState::Error);
-                            break;
-                        }
-                    }
-                }
+                    }) as Box<dyn FnMut(MessageEvent)>)
+                    .as_ref()
+                    .unchecked_ref(),
+                ));
+                //                    match get_next_state(&mut read).await {
+                //                        Ok(votes) => {
+                //                            if votes.find_name(&name) {
+                //                                vote_state.set(vote_page_from_votes(votes));
+                //                            } else {
+                //                                page_state.set(PageState::NotLoggedIn)
+                //                            }
+                //                        }
+                //                        Err(err) => {
+                //                            warn!(
+                //                                "Encountered error getting data from web socket for votes: {err:?}"
+                //                            );
+                //                            page_state.set(PageState::Error);
+                //                            break;
+                //                        }
+                //                    }
             }
         }
     });
@@ -408,7 +423,7 @@ async fn VoteComponent<'a, G: Html>(
         });
     };
     view! { cx,
-        div(on:click = |_| page_state.set(PageState::NotLoggedIn)) {"logout"}
+        div(on:click = move |_| page_state.set(PageState::NotLoggedIn)) {"logout"}
         ShirtSizes((shirt_sizes.clone(), is_admin, revealed, current_vote))
         hr {}
         ({
