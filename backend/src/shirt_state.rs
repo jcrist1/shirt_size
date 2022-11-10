@@ -71,10 +71,8 @@ pub mod shirt_service {
     use axum_sessions::{async_session::MemoryStore, extractors::WritableSession, SessionLayer};
     use futures::StreamExt;
     use futures::{stream, Stream};
-    use std::{
-        collections::HashMap,
-        sync::{Arc, RwLock},
-    };
+    use parking_lot::RwLock;
+    use std::{collections::HashMap, sync::Arc};
     use tokio::sync::broadcast;
     use tracing::info;
     use uuid::Uuid;
@@ -201,10 +199,7 @@ pub mod shirt_service {
         let current_id = session
             .get::<UserId>("id")
             .ok_or_else(|| Error::Message("Failed to find user".into()))?;
-        let mut users = state
-            .users
-            .write()
-            .expect("Users rw lock is poisoned. Cannot proceed");
+        let mut users = state.users.write();
         info!("USERS FOR VOTE: {:?}", *users);
         {
             let data = {
@@ -227,15 +222,9 @@ pub mod shirt_service {
     ) -> Result<Json<()>, Error> {
         bearer_validation.authorise(token)?;
         {
-            let mut revealed = state
-                .revealed
-                .write()
-                .expect("Shirt sizes lock poisoned, can't recover");
+            let mut revealed = state.revealed.write();
             *revealed = false;
-            let mut users = state
-                .users
-                .write()
-                .expect("Shirt sizes lock poisoned, can't recover");
+            let mut users = state.users.write();
             for (_, data) in users.iter_mut() {
                 data.vote = None;
             }
@@ -250,23 +239,14 @@ pub mod shirt_service {
         token: BearerToken,
     ) -> Result<Json<()>, Error> {
         bearer_validation.authorise(token)?;
-        let mut revealed = state
-            .revealed
-            .write()
-            .expect("Shirt sizes lock poisoned, can't recover");
+        let mut revealed = state.revealed.write();
         *revealed = true;
         sender.send(())?;
         Ok(Json(()))
     }
 
     async fn sizes_handler(state: ShirtSizeState) -> Result<Json<Vec<ShirtSize>>, Error> {
-        Ok(Json(
-            state
-                .sizes
-                .read()
-                .expect("Shirt sizes lock is poisoned, can't recover")
-                .to_vec(),
-        ))
+        Ok(Json(state.sizes.read().to_vec()))
     }
 
     // todo: add auth
@@ -279,18 +259,11 @@ pub mod shirt_service {
     ) -> Result<(), Error> {
         bearer_validation.authorise(token)?;
         {
-            let mut sizes = state
-                .sizes
-                .write()
-                .expect("Poisoned lock for shirt sizes cannot continue");
+            let mut sizes = state.sizes.write();
             *sizes = new_sizes;
         }
         {
-            state
-                .users
-                .write()
-                .expect("Poisoned lock for shirt sizes cannot continue")
-                .clear();
+            state.users.write().clear();
         }
         sender.send(())?;
         Ok(())
@@ -316,7 +289,7 @@ pub mod shirt_service {
                 }
             };
             session.insert("name", name.clone())?;
-            let mut users = state.users.write().expect("poisoned mutex, time to fail");
+            let mut users = state.users.write();
             users.insert(
                 user_id.clone(),
                 UserData {
@@ -331,8 +304,8 @@ pub mod shirt_service {
     }
 
     fn get_votes(state: &ShirtSizeState, own_id: &UserId) -> Result<Votes, Error> {
-        let visible = { *state.revealed.read().expect("Poisoned") };
-        let votes = state.users.read().expect("Poisoned RwLock. Cannot procees");
+        let visible = { *state.revealed.read() };
+        let votes = state.users.read();
         let own_vote = votes.get(own_id).map(|data| data.vote.clone()).flatten();
         let votes_iter = votes.iter();
 
