@@ -1,4 +1,3 @@
-use crate::Error;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, PartialEq, Eq, Hash, Deserialize, Serialize, Clone, Default)]
@@ -67,7 +66,7 @@ impl Votes {
 pub mod shirt_service {
     use axum::{
         extract::ws::{Message, WebSocket, WebSocketUpgrade},
-        response::{IntoResponse, Response},
+        response::Response,
         routing::get,
         Router,
     };
@@ -394,7 +393,7 @@ pub mod shirt_service {
         Ok(wsu.on_upgrade(handle_socket))
     }
 
-    async fn read(shirt_size_state: ShirtSizeState, mut receiver: SplitStream<WebSocket>) {
+    async fn read(_: ShirtSizeState, mut receiver: SplitStream<WebSocket>) {
         while let Some(message) = receiver.next().await {
             match message {
                 Ok(okay) => match okay {
@@ -423,23 +422,5 @@ pub mod shirt_service {
                 warn!("Error sending web-socket {err:?}");
             }
         }
-    }
-
-    async fn write_once(
-        shirt_size_state: &ShirtSizeState,
-        sender: &mut SplitSink<WebSocket, Message>,
-    ) -> Result<(), Error> {
-        let data = {
-            let sizes = shirt_size_state.sizes.read().unwrap().clone();
-            let users = shirt_size_state.users.read().unwrap().clone();
-            let revealed = *shirt_size_state.revealed.read().unwrap();
-            serde_json::to_string(&(sizes, users, revealed))?
-        };
-        let message = Message::Text(data);
-        sender
-            .send(message)
-            .await
-            .map_err(|err| Error::Message(format!("Failed to send {err:?}")))?;
-        Ok(())
     }
 }
