@@ -17,8 +17,9 @@ async-trait = "0.1"
 futures = "0.3"
 futures-util = "0.3.19"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1.11", features = ["sync"] }
 log = "0.4"
-axum = { version = "0.5", features = ["ws"]}
+axum = { version = "0.5" }
 tower-http = {version = "0.2", features = ["fs", "trace"]}
 tower = "0.4.12"
 tracing-subscriber = { version = "0.3", features = ["registry", "env-filter"] }
