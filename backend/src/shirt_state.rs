@@ -206,16 +206,19 @@ pub mod shirt_service {
             .write()
             .expect("Users rw lock is poisoned. Cannot proceed");
         info!("USERS FOR VOTE: {:?}", *users);
-        let data = {
-            users
-                .get_mut(&current_id)
-                .ok_or_else(|| Error::Message("Failed to find user".into()))?
-        };
+        {
+            let data = {
+                users
+                    .get_mut(&current_id)
+                    .ok_or_else(|| Error::Message("Failed to find user".into()))?
+            };
 
-        data.vote = Some(vote);
+            data.vote = Some(vote);
+        }
         sender.send(())?;
         Ok(())
     }
+
     async fn reset_handler(
         state: ShirtSizeState,
         sender: broadcast::Sender<()>,
