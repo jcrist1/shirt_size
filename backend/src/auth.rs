@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use axum::{
     extract::{FromRequest, RequestParts},
-    headers::{authorization::Bearer, Authorization, Header, SetCookie},
-    http::{HeaderMap, StatusCode},
+    headers::{authorization::Bearer, Authorization},
+    http::StatusCode,
     response::{IntoResponse, Response},
     Json, TypedHeader,
 };
