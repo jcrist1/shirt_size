@@ -64,23 +64,19 @@ impl Votes {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod shirt_service {
-    use axum::{
-        extract::ws::{Message, WebSocket, WebSocketUpgrade},
-        response::Response,
-        routing::get,
-        Router,
-    };
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use axum::{routing::get, Router};
     use axum::{routing::put, Json};
     use axum_sessions::extractors::ReadableSession;
     use axum_sessions::{async_session::MemoryStore, extractors::WritableSession, SessionLayer};
-    use futures::stream::SplitSink;
-    use futures::{stream::SplitStream, SinkExt, StreamExt};
+    use futures::StreamExt;
+    use futures::{stream, Stream};
     use std::{
         collections::HashMap,
         sync::{Arc, RwLock},
     };
     use tokio::sync::broadcast;
-    use tracing::{info, warn};
+    use tracing::info;
     use uuid::Uuid;
 
     use crate::{
@@ -124,7 +120,7 @@ pub mod shirt_service {
             let state = self.state.clone();
             let sender = self.sender.clone();
             let votes_handler =
-                move |ws, session: ReadableSession| votes_handler(state, sender, session, ws);
+                move |session: ReadableSession| sse_handler(state, session, sender.subscribe());
             let state = self.state.clone();
             let state_for_reset = self.state.clone();
             let state_for_reveal = self.state.clone();
@@ -144,7 +140,7 @@ pub mod shirt_service {
             let sender_for_reveal = self.sender.clone();
 
             Router::new()
-                .route("/votes-ws", get(votes_handler))
+                .route("/votes-sse", get(votes_handler))
                 .route(
                     "/reveal",
                     get(|token: BearerToken| {
@@ -357,68 +353,20 @@ pub mod shirt_service {
         Ok(votes)
     }
 
-    async fn send_votes(
-        state: &ShirtSizeState,
-        send: &mut SplitSink<WebSocket, Message>,
-        user_id: &UserId,
-    ) -> Result<(), Error> {
-        let votes_serialised = serde_json::to_string(&get_votes(state, user_id)?)?;
-        send.send(Message::Text(votes_serialised)).await?;
-        Ok(())
-    }
-
-    async fn votes_handler(
+    async fn sse_handler(
         state: ShirtSizeState,
-        sender: broadcast::Sender<()>,
         session: ReadableSession,
-        wsu: WebSocketUpgrade,
-    ) -> Result<Response, Error> {
-        let user_id = session
-            .get::<UserId>("id")
-            .ok_or_else(|| Error::Message("Failed to find a user id for current session".into()))?;
-        let rx = sender.subscribe();
-        let handle_socket = |ws: WebSocket| async move {
-            info!("Opening web socket");
-            let (mut sender, receiver) = ws.split();
-            match send_votes(&state, &mut sender, &user_id).await {
-                Ok(()) => {
-                    tokio::spawn(read(state.clone(), receiver));
-                    tokio::spawn(write(state, rx, sender, user_id.clone()));
-                }
-                Err(err) => warn!("Failed to get and send votes over new websocket: {err}"),
-            }
-        };
-        Ok(wsu.on_upgrade(handle_socket))
-    }
-
-    async fn read(_: ShirtSizeState, mut receiver: SplitStream<WebSocket>) {
-        while let Some(message) = receiver.next().await {
-            match message {
-                Ok(okay) => match okay {
-                    Message::Text(_) => (),
-                    Message::Binary(_) => (),
-                    Message::Ping(_) => (),
-                    Message::Pong(_) => (),
-                    Message::Close(_) => {
-                        info!("closing web-socket");
-                        return;
-                    }
-                },
-                Err(err) => warn!("Failed to read web socket: {err}"),
-            }
-        }
-    }
-
-    async fn write(
-        shirt_size_state: ShirtSizeState,
-        mut update: broadcast::Receiver<()>,
-        mut sender: SplitSink<WebSocket, Message>,
-        user_id: UserId,
-    ) {
-        while update.recv().await.is_ok() {
-            if let Err(err) = send_votes(&shirt_size_state, &mut sender, &user_id).await {
-                warn!("Error sending web-socket {err:?}");
-            }
-        }
+        receiver: broadcast::Receiver<()>,
+    ) -> Sse<impl Stream<Item = Result<Event, serde_json::Error>>> {
+        let user_id = session.get::<UserId>("id").expect("fuck it");
+        info!("Opening SSE connection for {:?}", user_id);
+        let initial = get_votes(&state, &user_id).expect("fuck it");
+        let stream = stream::once(async { initial })
+            .chain(
+                tokio_stream::wrappers::BroadcastStream::new(receiver)
+                    .map(move |_| get_votes(&state, &user_id).expect("fuck it again")),
+            )
+            .map(|votes| Event::default().json_data(&votes));
+        Sse::new(stream).keep_alive(KeepAlive::default())
     }
 }
