@@ -100,16 +100,14 @@ pub mod shirt_service {
     pub struct ShirtSizeService {
         state: ShirtSizeState,
         sender: broadcast::Sender<()>,
-        secret: Arc<BearerValidation>,
     }
 
     impl ShirtSizeService {
-        pub fn new(secret: &str) -> ShirtSizeService {
+        pub fn new() -> ShirtSizeService {
             let (sender, _) = broadcast::channel(10000);
             ShirtSizeService {
                 sender,
                 state: ShirtSizeState::default(),
-                secret: Arc::new(BearerValidation::new(secret)),
             }
         }
 
@@ -118,7 +116,11 @@ pub mod shirt_service {
         /// /votes DELETE
         /// /register PUT
         /// /shirt-sizes PUT
-        pub fn routes(&self, session_layer: SessionLayer<MemoryStore>) -> Router {
+        pub fn routes(
+            &self,
+            session_layer: SessionLayer<MemoryStore>,
+            bearer_validation: &'static BearerValidation,
+        ) -> Router {
             let state = self.state.clone();
             let sender = self.sender.clone();
             let votes_handler =
@@ -141,10 +143,6 @@ pub mod shirt_service {
             let sender_for_reset = self.sender.clone();
             let sender_for_reveal = self.sender.clone();
 
-            let secret_for_sizes = self.secret.clone();
-            let secret_for_login = self.secret.clone();
-            let secret_for_reset = self.secret.clone();
-            let secret_for_reveal = self.secret.clone();
             Router::new()
                 .route("/votes-ws", get(votes_handler))
                 .route(
@@ -153,7 +151,7 @@ pub mod shirt_service {
                         reveal_handler(
                             state_for_reveal,
                             sender_for_reveal,
-                            secret_for_reveal,
+                            bearer_validation,
                             token,
                         )
                     }),
@@ -161,7 +159,7 @@ pub mod shirt_service {
                 .route(
                     "/reset",
                     get(|token: BearerToken| {
-                        reset_handler(state_for_reset, sender_for_reset, secret_for_reset, token)
+                        reset_handler(state_for_reset, sender_for_reset, bearer_validation, token)
                     }),
                 )
                 .route("/sizes", get(|| sizes_handler(state_for_sizes)))
@@ -172,7 +170,7 @@ pub mod shirt_service {
                             data,
                             state_for_put_sizes,
                             sender_for_sizes,
-                            secret_for_sizes,
+                            bearer_validation,
                             token,
                         )
                     }),
@@ -180,7 +178,7 @@ pub mod shirt_service {
                 .route(
                     "/login",
                     put(|Json(data), session: WritableSession, token: BearerToken| {
-                        login_handler(data, sender, state, session, secret_for_login, token)
+                        login_handler(data, sender, state, session, bearer_validation, token)
                     }),
                 )
                 .route(
@@ -225,7 +223,7 @@ pub mod shirt_service {
     async fn reset_handler(
         state: ShirtSizeState,
         sender: broadcast::Sender<()>,
-        bearer_validation: Arc<BearerValidation>,
+        bearer_validation: &BearerValidation,
         token: BearerToken,
     ) -> Result<Json<()>, Error> {
         bearer_validation.authorise(token)?;
@@ -249,7 +247,7 @@ pub mod shirt_service {
     async fn reveal_handler(
         state: ShirtSizeState,
         sender: broadcast::Sender<()>,
-        bearer_validation: Arc<BearerValidation>,
+        bearer_validation: &BearerValidation,
         token: BearerToken,
     ) -> Result<Json<()>, Error> {
         bearer_validation.authorise(token)?;
@@ -277,7 +275,7 @@ pub mod shirt_service {
         new_sizes: Vec<ShirtSize>,
         state: ShirtSizeState,
         sender: broadcast::Sender<()>,
-        bearer_validation: Arc<BearerValidation>,
+        bearer_validation: &BearerValidation,
         token: BearerToken,
     ) -> Result<(), Error> {
         bearer_validation.authorise(token)?;
@@ -304,7 +302,7 @@ pub mod shirt_service {
         sender: broadcast::Sender<()>,
         state: ShirtSizeState,
         mut session: WritableSession,
-        bearer_validation: Arc<BearerValidation>,
+        bearer_validation: &BearerValidation,
         token: BearerToken,
     ) -> Result<Json<bool>, Error> {
         let is_admin = bearer_validation.authorise(token).is_ok();
