@@ -290,14 +290,19 @@ pub mod shirt_service {
             };
             session.insert("name", name.clone())?;
             let mut users = state.users.write();
-            users.insert(
-                user_id.clone(),
-                UserData {
-                    is_admin,
-                    name,
-                    vote: None,
-                },
-            );
+            match users.get_mut(&user_id) {
+                Some(user) => user.name = name,
+                None => {
+                    users.insert(
+                        user_id,
+                        UserData {
+                            is_admin,
+                            name,
+                            vote: None,
+                        },
+                    );
+                }
+            };
         };
         sender.send(())?;
         Ok(Json(is_admin))
@@ -306,7 +311,7 @@ pub mod shirt_service {
     fn get_votes(state: &ShirtSizeState, own_id: &UserId) -> Result<Votes, Error> {
         let visible = { *state.revealed.read() };
         let votes = state.users.read();
-        let own_vote = votes.get(own_id).map(|data| data.vote.clone()).flatten();
+        let own_vote = votes.get(own_id).and_then(|data| data.vote.clone());
         let votes_iter = votes.iter();
 
         let votes = if visible {
@@ -333,16 +338,21 @@ pub mod shirt_service {
         state: ShirtSizeState,
         session: ReadableSession,
         receiver: broadcast::Receiver<()>,
-    ) -> Sse<impl Stream<Item = Result<Event, serde_json::Error>>> {
-        let user_id = session.get::<UserId>("id").expect("fuck it");
+    ) -> Result<Sse<impl Stream<Item = Result<Event, Error>>>, Error> {
+        let user_id = session
+            .get::<UserId>("id")
+            .ok_or_else(|| Error::Message("Session not set".into()))?;
         info!("Opening SSE connection for {:?}", user_id);
-        let initial = get_votes(&state, &user_id).expect("fuck it");
+        let initial = get_votes(&state, &user_id);
         let stream = stream::once(async { initial })
             .chain(
                 tokio_stream::wrappers::BroadcastStream::new(receiver)
-                    .map(move |_| get_votes(&state, &user_id).expect("fuck it again")),
+                    .map(move |_| get_votes(&state, &user_id)),
             )
-            .map(|votes| Event::default().json_data(&votes));
-        Sse::new(stream).keep_alive(KeepAlive::default())
+            .map(|votes| {
+                let votes = votes?;
+                Ok(Event::default().json_data(&votes)?)
+            });
+        Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
     }
 }
