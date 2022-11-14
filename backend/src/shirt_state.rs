@@ -1,4 +1,3 @@
-use crate::Error;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, PartialEq, Eq, Hash, Deserialize, Serialize, Clone, Default)]
@@ -65,23 +64,17 @@ impl Votes {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod shirt_service {
-    use axum::{
-        extract::ws::{Message, WebSocket, WebSocketUpgrade},
-        response::{IntoResponse, Response},
-        routing::get,
-        Router,
-    };
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use axum::{routing::get, Router};
     use axum::{routing::put, Json};
     use axum_sessions::extractors::ReadableSession;
     use axum_sessions::{async_session::MemoryStore, extractors::WritableSession, SessionLayer};
-    use futures::stream::SplitSink;
-    use futures::{stream::SplitStream, SinkExt, StreamExt};
-    use std::{
-        collections::HashMap,
-        sync::{Arc, RwLock},
-    };
+    use futures::StreamExt;
+    use futures::{stream, Stream};
+    use parking_lot::RwLock;
+    use std::{collections::HashMap, sync::Arc};
     use tokio::sync::broadcast;
-    use tracing::{info, warn};
+    use tracing::info;
     use uuid::Uuid;
 
     use crate::{
@@ -101,16 +94,14 @@ pub mod shirt_service {
     pub struct ShirtSizeService {
         state: ShirtSizeState,
         sender: broadcast::Sender<()>,
-        secret: Arc<BearerValidation>,
     }
 
     impl ShirtSizeService {
-        pub fn new(secret: &str) -> ShirtSizeService {
+        pub fn new() -> ShirtSizeService {
             let (sender, _) = broadcast::channel(10000);
             ShirtSizeService {
                 sender,
                 state: ShirtSizeState::default(),
-                secret: Arc::new(BearerValidation::new(secret)),
             }
         }
 
@@ -119,11 +110,15 @@ pub mod shirt_service {
         /// /votes DELETE
         /// /register PUT
         /// /shirt-sizes PUT
-        pub fn routes(&self, session_layer: SessionLayer<MemoryStore>) -> Router {
+        pub fn routes(
+            &self,
+            session_layer: SessionLayer<MemoryStore>,
+            bearer_validation: &'static BearerValidation,
+        ) -> Router {
             let state = self.state.clone();
             let sender = self.sender.clone();
             let votes_handler =
-                move |ws, session: ReadableSession| votes_handler(state, sender, session, ws);
+                move |session: ReadableSession| sse_handler(state, session, sender.subscribe());
             let state = self.state.clone();
             let state_for_reset = self.state.clone();
             let state_for_reveal = self.state.clone();
@@ -142,19 +137,15 @@ pub mod shirt_service {
             let sender_for_reset = self.sender.clone();
             let sender_for_reveal = self.sender.clone();
 
-            let secret_for_sizes = self.secret.clone();
-            let secret_for_login = self.secret.clone();
-            let secret_for_reset = self.secret.clone();
-            let secret_for_reveal = self.secret.clone();
             Router::new()
-                .route("/votes-ws", get(votes_handler))
+                .route("/votes-sse", get(votes_handler))
                 .route(
                     "/reveal",
                     get(|token: BearerToken| {
                         reveal_handler(
                             state_for_reveal,
                             sender_for_reveal,
-                            secret_for_reveal,
+                            bearer_validation,
                             token,
                         )
                     }),
@@ -162,7 +153,7 @@ pub mod shirt_service {
                 .route(
                     "/reset",
                     get(|token: BearerToken| {
-                        reset_handler(state_for_reset, sender_for_reset, secret_for_reset, token)
+                        reset_handler(state_for_reset, sender_for_reset, bearer_validation, token)
                     }),
                 )
                 .route("/sizes", get(|| sizes_handler(state_for_sizes)))
@@ -173,7 +164,7 @@ pub mod shirt_service {
                             data,
                             state_for_put_sizes,
                             sender_for_sizes,
-                            secret_for_sizes,
+                            bearer_validation,
                             token,
                         )
                     }),
@@ -181,7 +172,7 @@ pub mod shirt_service {
                 .route(
                     "/login",
                     put(|Json(data), session: WritableSession, token: BearerToken| {
-                        login_handler(data, sender, state, session, secret_for_login, token)
+                        login_handler(data, sender, state, session, bearer_validation, token)
                     }),
                 )
                 .route(
@@ -208,38 +199,32 @@ pub mod shirt_service {
         let current_id = session
             .get::<UserId>("id")
             .ok_or_else(|| Error::Message("Failed to find user".into()))?;
-        let mut users = state
-            .users
-            .write()
-            .expect("Users rw lock is poisoned. Cannot proceed");
+        let mut users = state.users.write();
         info!("USERS FOR VOTE: {:?}", *users);
-        let data = {
-            users
-                .get_mut(&current_id)
-                .ok_or_else(|| Error::Message("Failed to find user".into()))?
-        };
+        {
+            let data = {
+                users
+                    .get_mut(&current_id)
+                    .ok_or_else(|| Error::Message("Failed to find user".into()))?
+            };
 
-        data.vote = Some(vote);
+            data.vote = Some(vote);
+        }
         sender.send(())?;
         Ok(())
     }
+
     async fn reset_handler(
         state: ShirtSizeState,
         sender: broadcast::Sender<()>,
-        bearer_validation: Arc<BearerValidation>,
+        bearer_validation: &BearerValidation,
         token: BearerToken,
     ) -> Result<Json<()>, Error> {
         bearer_validation.authorise(token)?;
         {
-            let mut revealed = state
-                .revealed
-                .write()
-                .expect("Shirt sizes lock poisoned, can't recover");
+            let mut revealed = state.revealed.write();
             *revealed = false;
-            let mut users = state
-                .users
-                .write()
-                .expect("Shirt sizes lock poisoned, can't recover");
+            let mut users = state.users.write();
             for (_, data) in users.iter_mut() {
                 data.vote = None;
             }
@@ -250,27 +235,18 @@ pub mod shirt_service {
     async fn reveal_handler(
         state: ShirtSizeState,
         sender: broadcast::Sender<()>,
-        bearer_validation: Arc<BearerValidation>,
+        bearer_validation: &BearerValidation,
         token: BearerToken,
     ) -> Result<Json<()>, Error> {
         bearer_validation.authorise(token)?;
-        let mut revealed = state
-            .revealed
-            .write()
-            .expect("Shirt sizes lock poisoned, can't recover");
+        let mut revealed = state.revealed.write();
         *revealed = true;
         sender.send(())?;
         Ok(Json(()))
     }
 
     async fn sizes_handler(state: ShirtSizeState) -> Result<Json<Vec<ShirtSize>>, Error> {
-        Ok(Json(
-            state
-                .sizes
-                .read()
-                .expect("Shirt sizes lock is poisoned, can't recover")
-                .to_vec(),
-        ))
+        Ok(Json(state.sizes.read().to_vec()))
     }
 
     // todo: add auth
@@ -278,23 +254,16 @@ pub mod shirt_service {
         new_sizes: Vec<ShirtSize>,
         state: ShirtSizeState,
         sender: broadcast::Sender<()>,
-        bearer_validation: Arc<BearerValidation>,
+        bearer_validation: &BearerValidation,
         token: BearerToken,
     ) -> Result<(), Error> {
         bearer_validation.authorise(token)?;
         {
-            let mut sizes = state
-                .sizes
-                .write()
-                .expect("Poisoned lock for shirt sizes cannot continue");
+            let mut sizes = state.sizes.write();
             *sizes = new_sizes;
         }
         {
-            state
-                .users
-                .write()
-                .expect("Poisoned lock for shirt sizes cannot continue")
-                .clear();
+            state.users.write().clear();
         }
         sender.send(())?;
         Ok(())
@@ -305,7 +274,7 @@ pub mod shirt_service {
         sender: broadcast::Sender<()>,
         state: ShirtSizeState,
         mut session: WritableSession,
-        bearer_validation: Arc<BearerValidation>,
+        bearer_validation: &BearerValidation,
         token: BearerToken,
     ) -> Result<Json<bool>, Error> {
         let is_admin = bearer_validation.authorise(token).is_ok();
@@ -320,24 +289,29 @@ pub mod shirt_service {
                 }
             };
             session.insert("name", name.clone())?;
-            let mut users = state.users.write().expect("poisoned mutex, time to fail");
-            users.insert(
-                user_id.clone(),
-                UserData {
-                    is_admin,
-                    name,
-                    vote: None,
-                },
-            );
+            let mut users = state.users.write();
+            match users.get_mut(&user_id) {
+                Some(user) => user.name = name,
+                None => {
+                    users.insert(
+                        user_id,
+                        UserData {
+                            is_admin,
+                            name,
+                            vote: None,
+                        },
+                    );
+                }
+            };
         };
         sender.send(())?;
         Ok(Json(is_admin))
     }
 
     fn get_votes(state: &ShirtSizeState, own_id: &UserId) -> Result<Votes, Error> {
-        let visible = { *state.revealed.read().expect("Poisoned") };
-        let votes = state.users.read().expect("Poisoned RwLock. Cannot procees");
-        let own_vote = votes.get(own_id).map(|data| data.vote.clone()).flatten();
+        let visible = { *state.revealed.read() };
+        let votes = state.users.read();
+        let own_vote = votes.get(own_id).and_then(|data| data.vote.clone());
         let votes_iter = votes.iter();
 
         let votes = if visible {
@@ -360,86 +334,25 @@ pub mod shirt_service {
         Ok(votes)
     }
 
-    async fn send_votes(
-        state: &ShirtSizeState,
-        send: &mut SplitSink<WebSocket, Message>,
-        user_id: &UserId,
-    ) -> Result<(), Error> {
-        let votes_serialised = serde_json::to_string(&get_votes(state, user_id)?)?;
-        send.send(Message::Text(votes_serialised)).await?;
-        Ok(())
-    }
-
-    async fn votes_handler(
+    async fn sse_handler(
         state: ShirtSizeState,
-        sender: broadcast::Sender<()>,
         session: ReadableSession,
-        wsu: WebSocketUpgrade,
-    ) -> Result<Response, Error> {
+        receiver: broadcast::Receiver<()>,
+    ) -> Result<Sse<impl Stream<Item = Result<Event, Error>>>, Error> {
         let user_id = session
             .get::<UserId>("id")
-            .ok_or_else(|| Error::Message("Failed to find a user id for current session".into()))?;
-        let rx = sender.subscribe();
-        let handle_socket = |ws: WebSocket| async move {
-            info!("Opening web socket");
-            let (mut sender, receiver) = ws.split();
-            match send_votes(&state, &mut sender, &user_id).await {
-                Ok(()) => {
-                    tokio::spawn(read(state.clone(), receiver));
-                    tokio::spawn(write(state, rx, sender, user_id.clone()));
-                }
-                Err(err) => warn!("Failed to get and send votes over new websocket: {err}"),
-            }
-        };
-        Ok(wsu.on_upgrade(handle_socket))
-    }
-
-    async fn read(shirt_size_state: ShirtSizeState, mut receiver: SplitStream<WebSocket>) {
-        while let Some(message) = receiver.next().await {
-            match message {
-                Ok(okay) => match okay {
-                    Message::Text(_) => (),
-                    Message::Binary(_) => (),
-                    Message::Ping(_) => (),
-                    Message::Pong(_) => (),
-                    Message::Close(_) => {
-                        info!("closing web-socket");
-                        return;
-                    }
-                },
-                Err(err) => warn!("Failed to read web socket: {err}"),
-            }
-        }
-    }
-
-    async fn write(
-        shirt_size_state: ShirtSizeState,
-        mut update: broadcast::Receiver<()>,
-        mut sender: SplitSink<WebSocket, Message>,
-        user_id: UserId,
-    ) {
-        while update.recv().await.is_ok() {
-            if let Err(err) = send_votes(&shirt_size_state, &mut sender, &user_id).await {
-                warn!("Error sending web-socket {err:?}");
-            }
-        }
-    }
-
-    async fn write_once(
-        shirt_size_state: &ShirtSizeState,
-        sender: &mut SplitSink<WebSocket, Message>,
-    ) -> Result<(), Error> {
-        let data = {
-            let sizes = shirt_size_state.sizes.read().unwrap().clone();
-            let users = shirt_size_state.users.read().unwrap().clone();
-            let revealed = *shirt_size_state.revealed.read().unwrap();
-            serde_json::to_string(&(sizes, users, revealed))?
-        };
-        let message = Message::Text(data);
-        sender
-            .send(message)
-            .await
-            .map_err(|err| Error::Message(format!("Failed to send {err:?}")))?;
-        Ok(())
+            .ok_or_else(|| Error::Message("Session not set".into()))?;
+        info!("Opening SSE connection for {:?}", user_id);
+        let initial = get_votes(&state, &user_id);
+        let stream = stream::once(async { initial })
+            .chain(
+                tokio_stream::wrappers::BroadcastStream::new(receiver)
+                    .map(move |_| get_votes(&state, &user_id)),
+            )
+            .map(|votes| {
+                let votes = votes?;
+                Ok(Event::default().json_data(&votes)?)
+            });
+        Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
     }
 }
