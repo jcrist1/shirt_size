@@ -5,7 +5,6 @@ use axum::{http::StatusCode, response::IntoResponse};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::sync::broadcast::error::SendError;
 
-use futures_util::sink::SinkErrInto;
 pub mod backend_config;
 pub mod shirt_state;
 

@@ -321,14 +321,29 @@ fn get_websocket() -> anyhow::Result<WebSocket> {
     let window = web_sys::window().ok_or_else(|| {
         Error::Message("Should be in a web_sys environment to open this web socket".into())
     })?;
-    let host = window
-        .location()
+    let location = window.location();
+    let protocol = match location
+        .protocol()
+        .map_err(|err| Error::Message(format!("Failed to get protocol for window: {err:?}")))?
+        .as_str()
+    {
+        "https:" => Ok("wss"),
+        "http:" => Ok("ws"),
+        unsupported => Err(Error::Message(format!(
+            "Unsupported protocol: {unsupported}"
+        ))),
+    }?;
+    let host = location
         .host()
         .map_err(|err| Error::Message(format!("Failed to get location for window: {err:?}")))?;
-    Ok(gloo_net::websocket::futures::WebSocket::open(&format!(
-        "ws://{host}/api/v1/shirt-size/votes-ws"
-    ))
-    .map_err(|err| Error::Message(format!("Failed to open Websocket: {err:?}")))?)
+    let url = format!("{protocol}://{host}/api/v1/shirt-size/votes-ws");
+    Ok(
+        gloo_net::websocket::futures::WebSocket::open(&url).map_err(|err| {
+            Error::Message(format!(
+                "Failed to open Websocket at url: {url}, error: {err:?}"
+            ))
+        })?,
+    )
 }
 
 #[allow(non_snake_case)]
@@ -351,7 +366,7 @@ async fn VoteComponent<'a, G: Html>(
     spawn_local_scoped(cx, async move {
         match get_websocket() {
             Err(err) => {
-                warn!("Encountered error openning web socket for votes: {err:?}");
+                warn!("Encountered error openning web socket for votes: {err}");
                 page_state.set(PageState::Error)
             }
             Ok(ws) => {
