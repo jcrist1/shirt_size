@@ -1,19 +1,19 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use futures::stream::SplitStream;
-use futures::{SinkExt, StreamExt};
-use gloo_net::websocket::futures::WebSocket;
-use gloo_net::websocket::Message;
+use anyhow::Context;
+use futures::stream;
+use futures::{FutureExt, StreamExt};
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
-use shirt_size_server::shirt_state::{Name, ShirtSize, UserId, Votes};
-use sycamore::futures::{spawn_local, spawn_local_scoped};
+use serde::Serialize;
+use shirt_size_server::shirt_state::{Name, ShirtSize, Votes};
+use sycamore::futures::spawn_local_scoped;
 use sycamore::prelude::*;
-use sycamore::suspense::Suspense;
+
+use js_sys::{Object, Uint8Array};
 use tracing::{info, warn};
 use wasm_bindgen::{JsCast, JsValue};
-use web_sys::{Event, HtmlInputElement};
+use web_sys::{Event, HtmlInputElement, ReadableStream, ReadableStreamDefaultReader};
 
 fn set_key_signal(event: Event, key_signal: &Signal<String>) -> anyhow::Result<()> {
     let value = event
@@ -185,27 +185,52 @@ fn set_local<T: Serialize>(key: &str, t: &T) -> anyhow::Result<()> {
 
 #[allow(non_snake_case)]
 #[component]
-async fn PageComponent<'a, G: Html>(cx: Scope<'a>) -> View<G> {
+async fn PageComponent<G: Html>(cx: Scope<'_>) -> View<G> {
     let (name, initial_state) = match get_local("name") {
         Err(err) => {
-            warn!("Now something is badly wrong. Try clearing local cookies/local storage");
+            warn!(
+                "Now something is badly wrong. Try clearing local cookies/local storage: {err:?}"
+            );
             (Name::new(String::new()), PageState::Error)
         }
         Ok(None) => (Name::new(String::new()), PageState::NotLoggedIn),
         Ok(Some(name)) => (name, PageState::NotLoggedIn),
     };
     let name = create_signal(cx, name);
-    let page_state = create_signal(cx, initial_state);
-    view! {cx, ({
+    let page_state: RcSignal<PageState> = create_rc_signal(initial_state);
+    view! {cx,  ({
+        let page_state_clone = page_state.clone();
+        let page_state_clone_2 = page_state.clone();
         match page_state.get().as_ref() {
             PageState::NotLoggedIn => view! { cx,
-                LoginComponent((name, page_state))
+                LoginComponent((name, page_state_clone))
             },
-            PageState::Error => view! { cx,
-                div {"Error"}
-            },
+            PageState::Error => {
+                view! {cx, ({
+                let page_state_clone = page_state_clone.clone();
+                let mut is_error = true;
+                spawn_local_scoped(cx, async move {
+                    while is_error {
+                        futures_timer::Delay::new(std::time::Duration::from_millis(300)).await;
+                        let stored_name = name.get();
+                        let new_state = match log_in(stored_name.as_ref()).await {
+                            Ok(new_state) => {
+                                is_error = false;
+                                new_state
+                            }
+                            Err(err) => {
+                                warn!("Failed to login: {err}");
+                                PageState::Error
+                            }
+                        };
+                        page_state_clone.set(new_state);
+                    }
+                });
+                view! { cx,  div {"Error"} }
+                })}
+            }
             PageState::VotePage { user, shirt_sizes, admin } => view! {cx,
-                VoteComponent((user.clone(), *admin, shirt_sizes.clone(), page_state ))
+                VoteComponent((user.clone(), *admin, shirt_sizes.clone(), page_state_clone_2))
             },
         }
     })}
@@ -215,7 +240,7 @@ async fn PageComponent<'a, G: Html>(cx: Scope<'a>) -> View<G> {
 #[component]
 async fn LoginComponent<'a, G: Html>(
     cx: Scope<'a>,
-    input: (&'a Signal<Name>, &'a Signal<PageState>),
+    input: (&'a Signal<Name>, RcSignal<PageState>),
 ) -> View<G> {
     let (name, page_state) = input;
     let change_name = move |event: Event| -> anyhow::Result<()> {
@@ -243,6 +268,7 @@ async fn LoginComponent<'a, G: Html>(
 
         }
         div(on:click = move |_| {
+            let page_state_clone = page_state.clone();
             spawn_local_scoped(cx, async move {
                 let name = name.get();
                 let new_state = match log_in(name.as_ref()).await {
@@ -252,18 +278,9 @@ async fn LoginComponent<'a, G: Html>(
                         PageState::Error
                     }
                 };
-                page_state.set(new_state);
+                page_state_clone.set(new_state);
             });
         }) {"login"}
-    }
-}
-
-async fn get_next_state(read: &mut SplitStream<WebSocket>) -> anyhow::Result<Votes> {
-    let next = read.next().await;
-    match next.ok_or_else(|| Error::Message("web socket for votes closed prematurely".into()))? {
-        Ok(Message::Text(text)) => Ok(serde_json::from_str::<Votes>(&text)?),
-        Ok(_) => Err(Error::Message("received wrong data type on websocket".into()).into()),
-        Err(err) => Err(Error::Message(format!("web socket error: {err}")).into()),
     }
 }
 
@@ -317,80 +334,120 @@ async fn reveal() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn get_websocket() -> anyhow::Result<WebSocket> {
-    let window = web_sys::window().ok_or_else(|| {
-        Error::Message("Should be in a web_sys environment to open this web socket".into())
-    })?;
-    let location = window.location();
-    let protocol = match location
-        .protocol()
-        .map_err(|err| Error::Message(format!("Failed to get protocol for window: {err:?}")))?
-        .as_str()
-    {
-        "https:" => Ok("wss"),
-        "http:" => Ok("ws"),
-        unsupported => Err(Error::Message(format!(
-            "Unsupported protocol: {unsupported}"
-        ))),
-    }?;
-    let host = location
-        .host()
-        .map_err(|err| Error::Message(format!("Failed to get location for window: {err:?}")))?;
-    let url = format!("{protocol}://{host}/api/v1/shirt-size/votes-ws");
-    Ok(
-        gloo_net::websocket::futures::WebSocket::open(&url).map_err(|err| {
-            Error::Message(format!(
-                "Failed to open Websocket at url: {url}, error: {err:?}"
-            ))
-        })?,
-    )
-}
-
 #[allow(non_snake_case)]
 #[component]
 async fn VoteComponent<'a, G: Html>(
     cx: Scope<'a>,
-    page_state: (Name, bool, Vec<ShirtSize>, &'a Signal<PageState>),
+    page_state: (Name, bool, Vec<ShirtSize>, RcSignal<PageState>),
 ) -> View<G> {
     let (name, is_admin, shirt_sizes, page_state) = page_state;
-    let vote_state = create_signal(
-        cx,
-        VotePageState::Voting {
-            own_vote: None,
-            users: vec![],
-        },
-    );
+    let vote_state = create_rc_signal(VotePageState::Voting {
+        own_vote: None,
+        users: vec![],
+    });
     let current_vote = create_signal(cx, None);
     let revealed = create_signal(cx, false);
 
-    spawn_local_scoped(cx, async move {
-        match get_websocket() {
-            Err(err) => {
-                warn!("Encountered error openning web socket for votes: {err}");
-                page_state.set(PageState::Error)
-            }
-            Ok(ws) => {
-                let (mut write, mut read) = ws.split();
-                loop {
-                    match get_next_state(&mut read).await {
-                        Ok(votes) => {
-                            if votes.find_name(&name) {
-                                vote_state.set(vote_page_from_votes(votes));
-                            } else {
-                                page_state.set(PageState::NotLoggedIn)
+    let page_state_for_handler = page_state.clone();
+    let vote_state_for_handler = vote_state.clone();
+    let event_source_stream: ReadableStream =
+        reqwasm::http::Request::get("/api/v1/shirt-size/votes-sse")
+            .send()
+            .await
+            .expect("Failed to get eventsource")
+            .body()
+            .expect("What up with this response body");
+    let default_reader = event_source_stream
+        .get_reader()
+        .dyn_into::<ReadableStreamDefaultReader>()
+        .expect("Okay");
+
+    let event_stream = || {
+        Box::pin(stream::unfold(false, move |is_done| {
+            let promise = default_reader.clone().read();
+            async move {
+                if !is_done {
+                    let res = wasm_bindgen_futures::JsFuture::from(promise)
+                        .map(|value_res| -> Result<(Votes, bool), anyhow::Error> {
+                            let value = value_res.map_err(|err| {
+                                Error::Message(format!(
+                                    "failed to get next event in event source:{err:?}"
+                                ))
+                            })?;
+                            let props = value.dyn_into::<Object>().map_err(|err| {
+                                Error::Message(format!(
+                                    "failed to cast to message event as object: {err:?}"
+                                ))
+                            })?;
+                            let byte_array =
+                                js_sys::Reflect::get(&props, &JsValue::from_str("value"))
+                                    .map_err(|err| {
+                                        Error::Message(format!("failed to get value : {err:?}"))
+                                    })?
+                                    .dyn_into::<Uint8Array>()
+                                    .map_err(|err| {
+                                        Error::Message(format!(
+                                            "failed to cast data in byte array: {err:?}"
+                                        ))
+                                    })?;
+                            let done = js_sys::Reflect::get(&props, &JsValue::from_str("done"))
+                                .map_err(|err| {
+                                    Error::Message(format!("failed to get done: {err:?}"))
+                                })?
+                                .as_bool()
+                                .ok_or_else(|| {
+                                    Error::Message("second element of object is not a bool".into())
+                                })?;
+                            let string = String::from_utf8(byte_array.to_vec())?;
+                            if string.len() < 5 {
+                                return Err(Error::Message(format!(
+                                    "Received a message event without \"data\" field: {string}"
+                                ))
+                                .into());
                             }
-                        }
+                            let (data_key, data) = string.split_at(5);
+                            if data_key == "data:" {
+                                let votes =
+                                    serde_json::from_str::<Votes>(data).context(format!(
+                                "Not votes in this sucky ass event source json?!?!?: {data}",
+                            ))?;
+                                Ok((votes, done))
+                            } else {
+                                Err(Error::Message(format!(
+                                    "event source didn't return any data: {data_key}, {data}"
+                                ))
+                                .into())
+                            }
+                        })
+                        .await;
+                    match res {
+                        Ok((votes, done)) => Some((votes, done)),
                         Err(err) => {
-                            warn!(
-                                "Encountered error getting data from web socket for votes: {err:?}"
-                            );
-                            page_state.set(PageState::Error);
-                            break;
+                            warn!("Failure in event source: {err}");
+                            None
                         }
                     }
+                } else {
+                    warn!("Closing sse!");
+                    None
                 }
             }
+        }))
+    };
+
+    let mut restarting_stream =
+        Box::pin(stream::repeat(event_stream).flat_map(|inner_stream| inner_stream()));
+
+    spawn_local_scoped(cx, async move {
+        while let Some(votes) = restarting_stream.next().await {
+            info!("Votes: {votes:?}");
+            if votes.find_name(&name) {
+                vote_state_for_handler.set(vote_page_from_votes(votes));
+            } else {
+                page_state_for_handler.set(PageState::NotLoggedIn)
+            }
         }
+        page_state_for_handler.set(PageState::Error)
     });
 
     let reset_clos = move |_| {
@@ -408,7 +465,8 @@ async fn VoteComponent<'a, G: Html>(
         });
     };
     view! { cx,
-        div(on:click = |_| page_state.set(PageState::NotLoggedIn)) {"logout"}
+        div(on:click = move |_| page_state.set(PageState::NotLoggedIn)) {"logout"}
+        h3 {"Voting Page"}
         ShirtSizes((shirt_sizes.clone(), is_admin, revealed, current_vote))
         hr {}
         ({
